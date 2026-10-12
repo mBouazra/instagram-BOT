@@ -1,0 +1,54 @@
+name: Stories quotidiennes
+
+on:
+  schedule:
+    # Toutes les heures de 4h à 21h UTC. Le script vérifie lui-même l'heure de Paris
+    # (été comme hiver) et ne publie qu'une fois par jour.
+    - cron: "7 4-21 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publier maintenant (même si déjà fait aujourd'hui)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Test à blanc (ne publie rien)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stories
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publier les stories
+        env:
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          IG_USER_ID: ${{ vars.IG_USER_ID }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: python post_stories.py
+
+      - name: Mémoriser la date de publication
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain last_posted.txt)" ]; then
+            git config user.name "story-bot"
+            git config user.email "story-bot@users.noreply.github.com"
+            git add last_posted.txt
+            git commit -m "Stories publiées le $(cat last_posted.txt)"
+            git push
+          fi

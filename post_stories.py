@@ -81,10 +81,37 @@ def list_reels():
     return reels
 
 
+def diagnose():
+    """Envoie UNE vidéo à Instagram sans la publier et affiche la réponse complète."""
+    reel = next(r for r in list_reels() if r.get("media_url"))
+    url = reel["media_url"]
+    print(f"🔍 Test sur le Reel {reel['id']}")
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            print(f"  Fichier : HTTP {r.status}, {r.headers.get('Content-Type')}, "
+                  f"{int(r.headers.get('Content-Length', 0)) / 1e6:.1f} Mo")
+    except Exception as e:
+        print(f"  Fichier inaccessible depuis GitHub : {e}")
+    c = call("POST", f"{USER_ID}/media", media_type="STORIES", video_url=url)
+    print(f"  Conteneur créé : {c}")
+    for _ in range(60):
+        info = call("GET", c["id"], fields="status_code,status")
+        print(f"  Statut : {info}")
+        if info.get("status_code") in ("FINISHED", "ERROR", "EXPIRED"):
+            break
+        time.sleep(5)
+    print("ℹ️  Rien n'a été publié.")
+
+
 def main():
     now = datetime.now(TZ)
     today = now.date().isoformat()
     last = STATE_FILE.read_text().strip() if STATE_FILE.exists() else ""
+
+    if os.environ.get("DIAG") == "1":
+        diagnose()
+        return
 
     if not FORCE:
         if CONFIG.get("paused"):
@@ -125,14 +152,15 @@ def main():
     # 2) Publier dans l'ordre, en attendant que chaque vidéo soit prête
     posted, failed = 0, len(reels) - len(queue)
     for i, reel_id, cid in queue:
-        status, deadline = "", time.time() + 300
+        status, detail, deadline = "", "", time.time() + 300
         while time.time() < deadline:
-            status = call("GET", cid, fields="status_code").get("status_code", "")
+            info = call("GET", cid, fields="status_code,status")
+            status, detail = info.get("status_code", ""), info.get("status", "")
             if status in ("FINISHED", "ERROR", "EXPIRED"):
                 break
             time.sleep(5)
         if status != "FINISHED":
-            print(f"  ❌ #{i} {reel_id} : traitement Instagram {status or 'trop long'}")
+            print(f"  ❌ #{i} {reel_id} : traitement Instagram {status or 'trop long'} — {detail}")
             failed += 1
             continue
         try:

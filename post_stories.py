@@ -12,6 +12,7 @@ Options : FORCE=1 pour ignorer l'heure et le "déjà posté aujourd'hui", DRY_RU
 """
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -81,26 +82,84 @@ def list_reels():
     return reels
 
 
-def diagnose():
-    """Envoie UNE vidéo à Instagram sans la publier et affiche la réponse complète."""
-    reel = next(r for r in list_reels() if r.get("media_url"))
-    url = reel["media_url"]
-    print(f"🔍 Test sur le Reel {reel['id']}")
-    try:
-        req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=30) as r:
-            print(f"  Fichier : HTTP {r.status}, {r.headers.get('Content-Type')}, "
-                  f"{int(r.headers.get('Content-Length', 0)) / 1e6:.1f} Mo")
-    except Exception as e:
-        print(f"  Fichier inaccessible depuis GitHub : {e}")
-    c = call("POST", f"{USER_ID}/media", media_type="STORIES", video_url=url)
-    print(f"  Conteneur créé : {c}")
+def wait_container(cid):
+    info = {}
     for _ in range(60):
-        info = call("GET", c["id"], fields="status_code,status")
-        print(f"  Statut : {info}")
+        info = call("GET", cid, fields="status_code,status")
         if info.get("status_code") in ("FINISHED", "ERROR", "EXPIRED"):
             break
         time.sleep(5)
+    return info
+
+
+def download(url, dest):
+    with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
+        f.write(r.read())
+    return dest
+
+
+def reencode(src, dest):
+    """Convertit au format story Instagram : 1080x1920, H.264, AAC 48 kHz, 30 i/s, ≤ 60 s."""
+    subprocess.run([
+        "ffmpeg", "-y", "-loglevel", "error", "-i", src, "-t", "59",
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
+               "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p",
+        "-c:v", "libx264", "-profile:v", "high", "-preset", "medium", "-crf", "23",
+        "-maxrate", "8M", "-bufsize", "16M",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart", dest], check=True)
+    return dest
+
+
+def resumable_upload(path):
+    """Crée un conteneur story et y envoie directement le fichier (sans lien public)."""
+    c = call("POST", f"{USER_ID}/media", media_type="STORIES", upload_type="resumable")
+    uri = c.get("uri") or f"https://rupload.facebook.com/ig-api-upload/v23.0/{c['id']}"
+    data = Path(path).read_bytes()
+    req = urllib.request.Request(uri, data=data, method="POST", headers={
+        "Authorization": f"OAuth {TOKEN}", "offset": "0", "file_size": str(len(data))})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            print(f"    envoi : {r.read().decode()[:200]}")
+    except urllib.error.HTTPError as e:
+        print(f"    envoi refusé : HTTP {e.code} {e.read().decode(errors='replace')[:300]}")
+    return c["id"]
+
+
+def public_host(path):
+    """Héberge le fichier 1 h sur litterbox.catbox.moe et renvoie son lien public."""
+    out = subprocess.run(["curl", "-sS", "-F", "reqtype=fileupload", "-F", "time=1h",
+                          "-F", f"fileToUpload=@{path}",
+                          "https://litterbox.catbox.moe/resources/internals/api.php"],
+                         capture_output=True, text=True, timeout=300)
+    return out.stdout.strip()
+
+
+def diagnose():
+    """Teste plusieurs façons d'envoyer UNE vidéo, sans jamais publier."""
+    reel = next(r for r in list_reels() if r.get("media_url"))
+    print(f"🔍 Test sur le Reel {reel['id']}")
+    tmp = Path(os.environ.get("RUNNER_TEMP", "/tmp"))
+    raw = download(reel["media_url"], tmp / "raw.mp4")
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                            "stream=codec_name,width,height,r_frame_rate,sample_rate:format=duration",
+                            "-of", "compact", str(raw)], capture_output=True, text=True)
+    print(f"  Fichier d'origine :\n    " + probe.stdout.strip().replace("\n", "\n    "))
+    fixed = reencode(str(raw), str(tmp / "story.mp4"))
+
+    tests = [
+        ("A. Envoi direct du fichier d'origine", lambda: resumable_upload(raw)),
+        ("B. Envoi direct du fichier converti", lambda: resumable_upload(fixed)),
+        ("C. Lien public du fichier converti", lambda: call(
+            "POST", f"{USER_ID}/media", media_type="STORIES", video_url=public_host(fixed))["id"]),
+    ]
+    for name, make in tests:
+        print(f"  {name}")
+        try:
+            info = wait_container(make())
+            print(f"    → {info.get('status_code')} {info.get('status', '')}")
+        except Exception as e:
+            print(f"    → échec : {e}")
     print("ℹ️  Rien n'a été publié.")
 
 

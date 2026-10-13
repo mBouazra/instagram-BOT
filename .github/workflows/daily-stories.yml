@@ -1,72 +1,5 @@
-
-1791807303209_image.png
-but this was 27 min ago
-
-Exact : il n’y a que ton test à blanc. Le passage automatique de 14h07 n’a pas encore démarré. C’est fréquent sur un dépôt tout neuf, GitHub met parfois une heure ou plus avant d’activer la planification. Pas besoin de l’attendre, on lance à la main :
-
-1. Remplace le fichier .github/workflows/daily-stories.yml par la version de mon message précédent :
-
-Onglet Code → dossier .github/workflows → daily-stories.yml → icône ✏️
-Ctrl+A, puis colle le nouveau contenu → Commit changes
-2. Lance le vrai passage :
-
-Onglet Actions → Stories quotidiennes dans le menu de gauche → bouton Run workflow à droite
-Ne coche aucune case → Run workflow
-Une nouvelle ligne avec un 🟡 rond jaune va apparaître. Clique dessus → post → Publier les stories pour voir les ✅ #1 publiée, ✅ #2 publiée… en direct. Tu devrais aussi voir les stories arriver sur Instagram au fur et à mesure.
-
-Si le passage automatique se déclenche plus tard, il verra ✅ Déjà publié aujourd'hui et ne fera rien.
-
-1791807440089_image.png
-Diagnosing missing output caused by stdout buffering.
-Diagnosing missing output caused by stdout buffering.
-Le bot tourne. Le 🟡 sur “Publier les stories” veut dire qu’il est en train d’envoyer les vidéos à Instagram.
-
-Tu ne vois pas encore les lignes ✅ #1 publiée… parce que Python garde ses messages en mémoire et les affiche souvent d’un coup à la fin. Ce n’est pas un problème.
-
-Pendant ce temps :
-
-Laisse tourner. Il va d’abord envoyer les 59 vidéos, puis les publier dans l’ordre. Compte environ 15 à 25 minutes au total.
-Regarde ton compte Instagram : les stories vont commencer à apparaître une par une après quelques minutes.
-Quand le rond devient ✅ ou ❌, envoie-moi la fin du journal avec la ligne 🎉 X stories publiées, Y en échec.
-
-Petit réglage pour la suite, à faire après ce run : dans daily-stories.yml, remplace run: python post_stories.py par run: python -u post_stories.py. Le -u affiche les messages en direct.
-
-Pasted text.txt
-Pasted text.txt
-TXT
-Edited 2 files, shared 2 files, and 4 more steps
-Bonne nouvelle d’abord : rien n’a été publié, donc pas de doublon ni de story cassée. Mais Instagram a refusé de traiter toutes les vidéos, et l’ancien script n’affichait pas pourquoi.
-
-Mon hypothèse la plus probable : Instagram refuse de télécharger des vidéos depuis ses propres liens de stockage (les liens scontent…cdninstagram.com). Il faut confirmer avec le vrai message d’erreur avant de corriger.
-
-1. Mets le bot en pause pour qu’il ne retente pas toutes les heures : dans config.json, mets "paused": true → Commit changes.
-
-2. Remplace les deux fichiers sur GitHub par les nouvelles versions :
-
-post_stories.py (à la racine) : ✏️ → Ctrl+A → colle le contenu du nouveau post_stories.py → Commit
-.github/workflows/daily-stories.yml : même chose avec daily-stories.yml
-Ou plus simple : Add file → Upload files, glisse post_stories.py dessus pour l’écraser, et fais pareil pour l’autre dans le dossier .github/workflows.
-
-3. Lance le diagnostic
-
-Actions → Stories quotidiennes → Run workflow → coche uniquement “Diagnostic sur 1 vidéo” → Run.
-
-Il teste une seule vidéo sans rien publier et affiche la réponse complète d’Instagram. Envoie-moi le journal, comme tout à l’heure, et je saurai exactement quoi corriger.
-
-
-Post stories
-PY 
-
-Daily stories
-YML 
-
-
-
-
-Claude is AI and can make mistakes.
-Daily stories · YML
 name: Stories quotidiennes
- 
+
 on:
   schedule:
     # Toutes les heures de 4h à 21h UTC. Le script vérifie lui-même l'heure de Paris
@@ -86,14 +19,14 @@ on:
         description: "Diagnostic sur 1 vidéo (ne publie rien)"
         type: boolean
         default: false
- 
+
 permissions:
   contents: write
- 
+
 concurrency:
   group: stories
   cancel-in-progress: false
- 
+
 jobs:
   post:
     runs-on: ubuntu-latest
@@ -102,11 +35,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
- 
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
- 
+
       - name: Publier les stories
         env:
           IG_TOKEN: ${{ secrets.IG_TOKEN }}
@@ -115,7 +48,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           DIAG: ${{ inputs.diag && '1' || '0' }}
         run: python -u post_stories.py
- 
+
       - name: Mémoriser la date de publication
         if: always()
         run: |
@@ -127,5 +60,3 @@ jobs:
             git pull --rebase
             git push
           fi
- 
-Claude finished the response

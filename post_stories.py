@@ -2,13 +2,15 @@
 Publie chaque jour tous les Reels de @myeleganza_ en story, dans le même ordre.
 
 - Une seule fournée par jour (heure réglable dans config.json) : les stories de la veille
-  expirent au moment où les nouvelles arrivent, donc tes 59 vidéos sont toujours visibles,
+  expirent au moment où les nouvelles arrivent, donc tes vidéos sont toujours visibles,
   jamais en double.
 - Ordre fixe : du Reel le plus ancien au plus récent (ou l'inverse via config.json).
-- Toutes les vidéos sont d'abord envoyées à Instagram, puis publiées une par une dans l'ordre.
+- Pour chaque Reel : téléchargement → conversion au format story (1080x1920) →
+  lien public temporaire (1 h) → envoi à Instagram. Puis publication dans l'ordre.
 
 Variables d'environnement : IG_TOKEN (secret GitHub), IG_USER_ID.
-Options : FORCE=1 pour ignorer l'heure et le "déjà posté aujourd'hui", DRY_RUN=1 pour tester sans publier.
+Options : FORCE=1 ignore l'heure et le "déjà posté aujourd'hui", DRY_RUN=1 ne publie rien,
+DIAG=1 teste une seule vidéo sans publier.
 """
 import json
 import os
@@ -18,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,15 +28,18 @@ from zoneinfo import ZoneInfo
 API = "https://graph.instagram.com"
 ROOT = Path(__file__).parent
 STATE_FILE = ROOT / "last_posted.txt"
+WORK = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "stories"
 TZ = ZoneInfo("Europe/Paris")
 
 TOKEN = os.environ["IG_TOKEN"]
 USER_ID = os.environ.get("IG_USER_ID", "me")
 FORCE = os.environ.get("FORCE") == "1"
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
+DIAG = os.environ.get("DIAG") == "1"
 CONFIG = json.loads((ROOT / "config.json").read_text())
 
 
+# ---------------------------------------------------------------- API Instagram
 def call(method, path, **params):
     """Appel Graph API avec reprise automatique sur limite de débit / erreur temporaire."""
     params["access_token"] = TOKEN
@@ -58,33 +64,30 @@ def call(method, path, **params):
                 print(f"  ⏳ limite/erreur temporaire ({code}), nouvel essai dans {wait}s")
                 time.sleep(wait)
                 continue
-            raise RuntimeError(f"{method} {path} → HTTP {e.code}: {err.get('message', body)}") from None
+            raise RuntimeError(f"HTTP {e.code}: {err.get('message', body)}") from None
         except urllib.error.URLError as e:
             if attempt < 5:
                 time.sleep(15)
                 continue
-            raise RuntimeError(f"{method} {path} → réseau: {e}") from None
+            raise RuntimeError(f"réseau: {e}") from None
 
 
 def list_reels():
-    reels, path, params = [], f"{USER_ID}/media", {
-        "fields": "id,media_product_type,media_type,media_url,timestamp", "limit": 100}
-    while path:
-        page = call("GET", path, **params)
+    reels, params = [], {"fields": "id,media_product_type,media_url,timestamp", "limit": 100}
+    while True:
+        page = call("GET", f"{USER_ID}/media", **params)
         reels += [m for m in page.get("data", []) if m.get("media_product_type") == "REELS"]
         nxt = page.get("paging", {}).get("next")
         if not nxt:
             break
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(nxt).query)
-        path = f"{USER_ID}/media"
-        params = {"fields": params["fields"], "limit": 100, "after": q["after"][0]}
+        params["after"] = urllib.parse.parse_qs(urllib.parse.urlparse(nxt).query)["after"][0]
     reels.sort(key=lambda m: m["timestamp"], reverse=CONFIG.get("order") == "newest_first")
     return reels
 
 
-def wait_container(cid):
-    info = {}
-    for _ in range(60):
+def wait_container(cid, timeout=300):
+    info, deadline = {}, time.time() + timeout
+    while time.time() < deadline:
         info = call("GET", cid, fields="status_code,status")
         if info.get("status_code") in ("FINISHED", "ERROR", "EXPIRED"):
             break
@@ -92,84 +95,78 @@ def wait_container(cid):
     return info
 
 
+# ---------------------------------------------------------------- préparation vidéo
 def download(url, dest):
-    with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
-        f.write(r.read())
-    return dest
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
+                f.write(r.read())
+            return dest
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(5)
 
 
 def reencode(src, dest):
-    """Convertit au format story Instagram : 1080x1920, H.264, AAC 48 kHz, 30 i/s, ≤ 60 s."""
+    """Format story Instagram : 1080x1920, H.264, AAC 48 kHz, 30 i/s, 59 s max."""
     subprocess.run([
-        "ffmpeg", "-y", "-loglevel", "error", "-i", src, "-t", "59",
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-t", "59",
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,"
                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p",
-        "-c:v", "libx264", "-profile:v", "high", "-preset", "medium", "-crf", "23",
+        "-c:v", "libx264", "-profile:v", "high", "-preset", "fast", "-crf", "20",
         "-maxrate", "8M", "-bufsize", "16M",
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
-        "-movflags", "+faststart", dest], check=True)
+        "-movflags", "+faststart", str(dest)], check=True)
     return dest
 
 
-def resumable_upload(path):
-    """Crée un conteneur story et y envoie directement le fichier (sans lien public)."""
-    c = call("POST", f"{USER_ID}/media", media_type="STORIES", upload_type="resumable")
-    uri = c.get("uri") or f"https://rupload.facebook.com/ig-api-upload/v23.0/{c['id']}"
-    data = Path(path).read_bytes()
-    req = urllib.request.Request(uri, data=data, method="POST", headers={
-        "Authorization": f"OAuth {TOKEN}", "offset": "0", "file_size": str(len(data))})
-    try:
-        with urllib.request.urlopen(req, timeout=300) as r:
-            print(f"    envoi : {r.read().decode()[:200]}")
-    except urllib.error.HTTPError as e:
-        print(f"    envoi refusé : HTTP {e.code} {e.read().decode(errors='replace')[:300]}")
-    return c["id"]
-
-
-def public_host(path):
+def public_link(path):
     """Héberge le fichier 1 h sur litterbox.catbox.moe et renvoie son lien public."""
-    out = subprocess.run(["curl", "-sS", "-F", "reqtype=fileupload", "-F", "time=1h",
-                          "-F", f"fileToUpload=@{path}",
-                          "https://litterbox.catbox.moe/resources/internals/api.php"],
-                         capture_output=True, text=True, timeout=300)
-    return out.stdout.strip()
+    out = ""
+    for attempt in range(4):
+        out = subprocess.run(
+            ["curl", "-sS", "--max-time", "180", "-F", "reqtype=fileupload", "-F", "time=1h",
+             "-F", f"fileToUpload=@{path}",
+             "https://litterbox.catbox.moe/resources/internals/api.php"],
+            capture_output=True, text=True).stdout.strip()
+        if out.startswith("https://"):
+            return out
+        time.sleep(10 * (attempt + 1))
+    raise RuntimeError(f"hébergement temporaire indisponible ({out[:100]})")
 
 
-def diagnose():
-    """Teste plusieurs façons d'envoyer UNE vidéo, sans jamais publier."""
-    reel = next(r for r in list_reels() if r.get("media_url"))
-    print(f"🔍 Test sur le Reel {reel['id']}")
-    tmp = Path(os.environ.get("RUNNER_TEMP", "/tmp"))
-    raw = download(reel["media_url"], tmp / "raw.mp4")
-    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                            "stream=codec_name,width,height,r_frame_rate,sample_rate:format=duration",
-                            "-of", "compact", str(raw)], capture_output=True, text=True)
-    print(f"  Fichier d'origine :\n    " + probe.stdout.strip().replace("\n", "\n    "))
-    fixed = reencode(str(raw), str(tmp / "story.mp4"))
-
-    tests = [
-        ("A. Envoi direct du fichier d'origine", lambda: resumable_upload(raw)),
-        ("B. Envoi direct du fichier converti", lambda: resumable_upload(fixed)),
-        ("C. Lien public du fichier converti", lambda: call(
-            "POST", f"{USER_ID}/media", media_type="STORIES", video_url=public_host(fixed))["id"]),
-    ]
-    for name, make in tests:
-        print(f"  {name}")
-        try:
-            info = wait_container(make())
-            print(f"    → {info.get('status_code')} {info.get('status', '')}")
-        except Exception as e:
-            print(f"    → échec : {e}")
-    print("ℹ️  Rien n'a été publié.")
+def prepare(idx, reel):
+    """Télécharge, convertit, héberge et crée le conteneur story. Renvoie l'ID du conteneur."""
+    source = CONFIG.get("video_urls", {}).get(reel["id"]) or reel.get("media_url")
+    if not source:
+        raise RuntimeError("pas de fichier fourni par Instagram → ajoute-le dans video_urls")
+    raw = download(source, WORK / f"{idx}_raw.mp4")
+    story = reencode(raw, WORK / f"{idx}_story.mp4")
+    link = public_link(story)
+    return call("POST", f"{USER_ID}/media", media_type="STORIES", video_url=link)["id"]
 
 
+def safe_prepare(item):
+    idx, reel = item
+    try:
+        return idx, reel["id"], prepare(idx, reel), None
+    except Exception as e:
+        return idx, reel["id"], None, str(e)
+
+
+# ---------------------------------------------------------------- programme
 def main():
+    WORK.mkdir(parents=True, exist_ok=True)
     now = datetime.now(TZ)
     today = now.date().isoformat()
     last = STATE_FILE.read_text().strip() if STATE_FILE.exists() else ""
 
-    if os.environ.get("DIAG") == "1":
-        diagnose()
+    if DIAG:
+        reel = next(r for r in list_reels() if r.get("media_url"))
+        print(f"🔍 Test sur le Reel {reel['id']} (rien ne sera publié)")
+        cid = prepare(0, reel)
+        print(f"  → {wait_container(cid)}")
         return
 
     if not FORCE:
@@ -184,54 +181,44 @@ def main():
             return
 
     skip = set(CONFIG.get("skip", []))
-    urls = CONFIG.get("video_urls", {})
     reels = [r for r in list_reels() if r["id"] not in skip]
     print(f"📦 {len(reels)} Reels à publier (ordre : {CONFIG.get('order', 'oldest_first')})")
 
-    # 1) Envoyer toutes les vidéos à Instagram (elles se traitent en parallèle de leur côté)
-    queue = []
-    for i, r in enumerate(reels, 1):
-        video = urls.get(r["id"]) or r.get("media_url")
-        if not video:
-            print(f"  ⚠️  #{i} {r['id']} : pas de fichier fourni par Instagram → ajoute-le dans video_urls")
-            continue
-        if DRY_RUN:
-            queue.append((i, r["id"], None))
-            continue
-        try:
-            c = call("POST", f"{USER_ID}/media", media_type="STORIES", video_url=video)
-            queue.append((i, r["id"], c["id"]))
-        except RuntimeError as e:
-            print(f"  ❌ #{i} {r['id']} : envoi refusé — {e}")
-
     if DRY_RUN:
-        print(f"🧪 DRY_RUN : {len(queue)} stories seraient publiées. Rien n'a été posté.")
+        missing = [r["id"] for r in reels
+                   if not (CONFIG.get("video_urls", {}).get(r["id"]) or r.get("media_url"))]
+        print(f"🧪 DRY_RUN : {len(reels) - len(missing)} stories seraient publiées, "
+              f"{len(missing)} sans fichier : {missing}")
         return
 
-    # 2) Publier dans l'ordre, en attendant que chaque vidéo soit prête
-    posted, failed = 0, len(reels) - len(queue)
-    for i, reel_id, cid in queue:
-        status, detail, deadline = "", "", time.time() + 300
-        while time.time() < deadline:
-            info = call("GET", cid, fields="status_code,status")
-            status, detail = info.get("status_code", ""), info.get("status", "")
-            if status in ("FINISHED", "ERROR", "EXPIRED"):
-                break
-            time.sleep(5)
-        if status != "FINISHED":
-            print(f"  ❌ #{i} {reel_id} : traitement Instagram {status or 'trop long'} — {detail}")
+    # 1) Préparer toutes les vidéos (4 en parallèle), en gardant l'ordre
+    print("🎬 Préparation des vidéos…")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        prepared = list(pool.map(safe_prepare, enumerate(reels, 1)))
+
+    # 2) Publier dans l'ordre
+    posted, failed = 0, 0
+    for idx, reel_id, cid, err in prepared:
+        if err:
+            print(f"  ❌ #{idx} {reel_id} : {err}")
+            failed += 1
+            continue
+        info = wait_container(cid)
+        if info.get("status_code") != "FINISHED":
+            print(f"  ❌ #{idx} {reel_id} : traitement Instagram {info.get('status_code')} "
+                  f"{info.get('status', '')}")
             failed += 1
             continue
         try:
             call("POST", f"{USER_ID}/media_publish", creation_id=cid)
         except RuntimeError as e:
-            print(f"  ❌ #{i} {reel_id} : publication refusée — {e}")
+            print(f"  ❌ #{idx} {reel_id} : publication refusée — {e}")
             failed += 1
             continue
         if posted == 0:  # dès la 1re story publiée, on note la date pour ne jamais doubler
             STATE_FILE.write_text(today + "\n")
         posted += 1
-        print(f"  ✅ #{i} {reel_id} publiée")
+        print(f"  ✅ #{idx} {reel_id} publiée")
 
     print(f"\n🎉 {posted} stories publiées, {failed} en échec.")
     if failed:

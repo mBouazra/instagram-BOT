@@ -1,7 +1,7 @@
 {
   "post_hour": 14,
   "order": "oldest_first",
-  "paused": true,
+  "paused": false,
   "skip": [],
   "video_urls": {}
 }

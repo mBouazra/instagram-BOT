@@ -150,8 +150,11 @@ def prepare(idx, reel):
 def safe_prepare(item):
     idx, reel = item
     try:
-        return idx, reel["id"], prepare(idx, reel), None
+        cid = prepare(idx, reel)
+        print(f"  🎬 #{idx} prête")
+        return idx, reel["id"], cid, None
     except Exception as e:
+        print(f"  ⚠️  #{idx} préparation échouée : {e}")
         return idx, reel["id"], None, str(e)
 
 
@@ -200,10 +203,16 @@ def main():
     posted, failed = 0, 0
     for idx, reel_id, cid, err in prepared:
         if err:
-            print(f"  ❌ #{idx} {reel_id} : {err}")
-            failed += 1
+            if "pas de fichier" in err:  # Reel avec musique sous licence : simple avertissement
+                print(f"  ⚠️  #{idx} {reel_id} ignorée : {err}")
+            else:
+                print(f"  ❌ #{idx} {reel_id} : {err}")
+                failed += 1
             continue
-        info = wait_container(cid)
+        try:
+            info = wait_container(cid)
+        except RuntimeError as e:
+            info = {"status_code": "ERROR", "status": str(e)}
         if info.get("status_code") != "FINISHED":
             print(f"  ❌ #{idx} {reel_id} : traitement Instagram {info.get('status_code')} "
                   f"{info.get('status', '')}")

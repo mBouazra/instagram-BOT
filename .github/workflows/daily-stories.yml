@@ -40,6 +40,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Installer ffmpeg
+        run: which ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+
       - name: Publier les stories
         env:
           IG_TOKEN: ${{ secrets.IG_TOKEN }}

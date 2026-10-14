@@ -4,7 +4,7 @@ on:
   schedule:
     # Plusieurs essais par après-midi (heures UTC) : GitHub saute souvent des créneaux.
     # Le script vérifie l'heure de Paris et ne publie qu'une fois par jour.
-    - cron: "17,47 12-16 * * *"
+    - cron: "17,47 12-20 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -70,7 +70,7 @@ jobs:
             git config user.name "story-bot"
             git config user.email "story-bot@users.noreply.github.com"
             git add last_posted.txt video_cache.json
-            git commit -m "Stories du $(cat last_posted.txt)"
+            git commit -m "Stories du $(cut -c1-10 last_posted.txt)"
             git pull --rebase
             git push
           fi

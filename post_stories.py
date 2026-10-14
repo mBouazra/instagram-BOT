@@ -21,7 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,6 +31,7 @@ STATE_FILE = ROOT / "last_posted.txt"
 CACHE_FILE = ROOT / "video_cache.json"  # liens des vidéos déjà converties
 WORK = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "stories"
 TZ = ZoneInfo("Europe/Paris")
+GAP_HOURS = 23  # attendre que la fournée de la veille ait (presque) expiré : pas de doublon
 
 TOKEN = os.environ["IG_TOKEN"]
 USER_ID = os.environ.get("IG_USER_ID", "me")
@@ -191,6 +192,12 @@ def main():
     now = datetime.now(TZ)
     today = now.date().isoformat()
     last = STATE_FILE.read_text().strip() if STATE_FILE.exists() else ""
+    try:  # date + heure de la dernière fournée (ancien format : date seule)
+        last_dt = datetime.fromisoformat(last if "T" in last else last + "T14:00")
+        last_dt = last_dt if last_dt.tzinfo else last_dt.replace(tzinfo=TZ)
+    except ValueError:
+        last_dt = None
+    ready_at = last_dt + timedelta(hours=GAP_HOURS) if last_dt else now
 
     if DIAG:
         reel = next(r for r in list_reels() if r.get("media_url"))
@@ -204,8 +211,11 @@ def main():
         reason = ""
         if CONFIG.get("paused"):
             reason = "⏸  En pause (config.json → paused: true). Rien à faire."
-        elif last == today:
-            reason = f"✅ Déjà publié aujourd'hui ({today}). Rien à faire."
+        elif last_dt and last_dt.date() == now.date():
+            reason = f"✅ Déjà publié aujourd'hui ({last_dt:%H:%M}). Rien à faire."
+        elif now < ready_at:
+            reason = (f"⏳ Les stories d'hier ({last_dt:%d/%m %H:%M}) sont encore en ligne, "
+                      f"prochaine fournée après {ready_at:%H:%M}.")
         elif now.hour < CONFIG["post_hour"]:
             reason = f"🕗 Il est {now:%H:%M} à Paris, publication prévue à {CONFIG['post_hour']}h."
         if CHECK:  # vérification rapide avant d'installer ffmpeg
@@ -273,7 +283,7 @@ def main():
             failed += 1
             continue
         if posted == 0:  # dès la 1re story publiée, on note la date pour ne jamais doubler
-            STATE_FILE.write_text(today + "\n")
+            STATE_FILE.write_text(datetime.now(TZ).isoformat(timespec="minutes") + "\n")
         posted += 1
         print(f"  ✅ #{idx} {reel_id} publiée")
 

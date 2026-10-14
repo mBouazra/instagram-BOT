@@ -66,11 +66,11 @@ jobs:
       - name: Mémoriser la date de publication
         if: always()
         run: |
-          if [ -n "$(git status --porcelain last_posted.txt)" ]; then
+          if [ -n "$(git status --porcelain last_posted.txt video_cache.json)" ]; then
             git config user.name "story-bot"
             git config user.email "story-bot@users.noreply.github.com"
-            git add last_posted.txt
-            git commit -m "Stories publiées le $(cat last_posted.txt)"
+            git add last_posted.txt video_cache.json
+            git commit -m "Stories du $(cat last_posted.txt)"
             git pull --rebase
             git push
           fi

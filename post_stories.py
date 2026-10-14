@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 API = "https://graph.instagram.com"
 ROOT = Path(__file__).parent
 STATE_FILE = ROOT / "last_posted.txt"
+CACHE_FILE = ROOT / "video_cache.json"  # liens des vidéos déjà converties
 WORK = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "stories"
 TZ = ZoneInfo("Europe/Paris")
 
@@ -38,6 +39,7 @@ DRY_RUN = os.environ.get("DRY_RUN") == "1"
 DIAG = os.environ.get("DIAG") == "1"
 CHECK = os.environ.get("CHECK") == "1"
 CONFIG = json.loads((ROOT / "config.json").read_text())
+CACHE = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
 
 
 # ---------------------------------------------------------------- API Instagram
@@ -122,41 +124,65 @@ def reencode(src, dest):
     return dest
 
 
-def public_link(path):
-    """Héberge le fichier 1 h sur litterbox.catbox.moe et renvoie son lien public."""
+def upload(path, endpoint, extra):
     out = ""
-    for attempt in range(4):
+    for attempt in range(3):
         out = subprocess.run(
-            ["curl", "-sS", "--max-time", "180", "-F", "reqtype=fileupload", "-F", "time=1h",
-             "-F", f"fileToUpload=@{path}",
-             "https://litterbox.catbox.moe/resources/internals/api.php"],
+            ["curl", "-sS", "--max-time", "180", "-F", "reqtype=fileupload", *extra,
+             "-F", f"fileToUpload=@{path}", endpoint],
             capture_output=True, text=True).stdout.strip()
         if out.startswith("https://"):
             return out
         time.sleep(10 * (attempt + 1))
-    raise RuntimeError(f"hébergement temporaire indisponible ({out[:100]})")
+    return None
 
 
-def prepare(idx, reel):
-    """Télécharge, convertit, héberge et crée le conteneur story. Renvoie l'ID du conteneur."""
+def public_link(path):
+    """Héberge la vidéo convertie. Renvoie (lien, permanent ?)."""
+    link = upload(path, "https://catbox.moe/user/api.php", [])  # lien permanent, réutilisé chaque jour
+    if link:
+        return link, True
+    link = upload(path, "https://litterbox.catbox.moe/resources/internals/api.php",
+                  ["-F", "time=72h"])  # secours : lien temporaire
+    if link:
+        return link, False
+    raise RuntimeError("hébergement indisponible")
+
+
+def build_link(idx, reel):
+    """Télécharge, convertit et héberge la vidéo d'un Reel (fait une seule fois par Reel)."""
     source = CONFIG.get("video_urls", {}).get(reel["id"]) or reel.get("media_url")
     if not source:
         raise RuntimeError("pas de fichier fourni par Instagram → ajoute-le dans video_urls")
     raw = download(source, WORK / f"{idx}_raw.mp4")
     story = reencode(raw, WORK / f"{idx}_story.mp4")
-    link = public_link(story)
+    link, permanent = public_link(story)
+    if permanent:
+        CACHE[reel["id"]] = link
+    return link
+
+
+def prepare(idx, reel, fresh=False):
+    """Crée le conteneur story (avec la vidéo déjà prête si elle existe). Renvoie son ID."""
+    link = None if fresh else CACHE.get(reel["id"])
+    if not link:
+        link = build_link(idx, reel)
     return call("POST", f"{USER_ID}/media", media_type="STORIES", video_url=link)["id"]
 
 
-def safe_prepare(item):
+def safe_prepare(item, fresh=False):
     idx, reel = item
     try:
-        cid = prepare(idx, reel)
+        cid = prepare(idx, reel, fresh)
         print(f"  🎬 #{idx} prête")
-        return idx, reel["id"], cid, None
+        return idx, reel, cid, None
     except Exception as e:
         print(f"  ⚠️  #{idx} préparation échouée : {e}")
-        return idx, reel["id"], None, str(e)
+        return idx, reel, None, str(e)
+
+
+def save_cache():
+    CACHE_FILE.write_text(json.dumps(CACHE, indent=1, sort_keys=True) + "\n")
 
 
 # ---------------------------------------------------------------- programme
@@ -205,14 +231,17 @@ def main():
               f"{len(missing)} sans fichier : {missing}")
         return
 
-    # 1) Préparer toutes les vidéos (4 en parallèle), en gardant l'ordre
-    print("🎬 Préparation des vidéos…")
+    # 1) Préparer toutes les vidéos (4 en parallèle), en gardant l'ordre.
+    #    Les vidéos déjà converties les jours précédents sont réutilisées directement.
+    print(f"🎬 Préparation ({sum(r['id'] in CACHE for r in reels)} vidéos déjà prêtes)…")
     with ThreadPoolExecutor(max_workers=4) as pool:
         prepared = list(pool.map(safe_prepare, enumerate(reels, 1)))
+    save_cache()
 
     # 2) Publier dans l'ordre
     posted, failed = 0, 0
-    for idx, reel_id, cid, err in prepared:
+    for idx, reel, cid, err in prepared:
+        reel_id = reel["id"]
         if err:
             if "pas de fichier" in err:  # Reel avec musique sous licence : simple avertissement
                 print(f"  ⚠️  #{idx} {reel_id} ignorée : {err}")
@@ -224,6 +253,13 @@ def main():
             info = wait_container(cid)
         except RuntimeError as e:
             info = {"status_code": "ERROR", "status": str(e)}
+        if info.get("status_code") != "FINISHED":
+            # lien en cache peut-être mort : on reconvertit la vidéo et on réessaie une fois
+            print(f"  🔁 #{idx} refusée ({info.get('status_code')}), nouvelle conversion…")
+            CACHE.pop(reel_id, None)
+            _, _, cid, err = safe_prepare((idx, reel), fresh=True)
+            save_cache()
+            info = {"status_code": "ERROR", "status": err} if err else wait_container(cid)
         if info.get("status_code") != "FINISHED":
             print(f"  ❌ #{idx} {reel_id} : traitement Instagram {info.get('status_code')} "
                   f"{info.get('status', '')}")

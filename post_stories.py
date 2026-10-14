@@ -36,6 +36,7 @@ USER_ID = os.environ.get("IG_USER_ID", "me")
 FORCE = os.environ.get("FORCE") == "1"
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 DIAG = os.environ.get("DIAG") == "1"
+CHECK = os.environ.get("CHECK") == "1"
 CONFIG = json.loads((ROOT / "config.json").read_text())
 
 
@@ -173,15 +174,25 @@ def main():
         return
 
     if not FORCE:
+        reason = ""
         if CONFIG.get("paused"):
-            print("⏸  En pause (config.json → paused: true). Rien à faire.")
+            reason = "⏸  En pause (config.json → paused: true). Rien à faire."
+        elif last == today:
+            reason = f"✅ Déjà publié aujourd'hui ({today}). Rien à faire."
+        elif now.hour < CONFIG["post_hour"]:
+            reason = f"🕗 Il est {now:%H:%M} à Paris, publication prévue à {CONFIG['post_hour']}h."
+        if CHECK:  # vérification rapide avant d'installer ffmpeg
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                f.write(f"run={'false' if reason else 'true'}\n")
+        if reason:
+            print(reason)
             return
-        if last == today:
-            print(f"✅ Déjà publié aujourd'hui ({today}). Rien à faire.")
-            return
-        if now.hour < CONFIG["post_hour"]:
-            print(f"🕗 Il est {now:%H:%M} à Paris, publication prévue à {CONFIG['post_hour']}h.")
-            return
+    elif CHECK:
+        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write("run=true\n")
+    if CHECK:
+        print("▶️  Publication à lancer.")
+        return
 
     skip = set(CONFIG.get("skip", []))
     reels = [r for r in list_reels() if r["id"] not in skip]

@@ -2,9 +2,9 @@ name: Stories quotidiennes
 
 on:
   schedule:
-    # Toutes les heures de 4h à 21h UTC. Le script vérifie lui-même l'heure de Paris
-    # (été comme hiver) et ne publie qu'une fois par jour.
-    - cron: "7 4-21 * * *"
+    # Plusieurs essais par après-midi (heures UTC) : GitHub saute souvent des créneaux.
+    # Le script vérifie l'heure de Paris et ne publie qu'une fois par jour.
+    - cron: "17,47 12-16 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -40,10 +40,21 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Vérifier s'il faut publier
+        id: check
+        if: ${{ !inputs.dry_run && !inputs.diag }}
+        env:
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
+          CHECK: "1"
+        run: python -u post_stories.py
+
       - name: Installer ffmpeg
+        if: ${{ steps.check.outputs.run == 'true' || inputs.dry_run || inputs.diag }}
         run: which ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
 
       - name: Publier les stories
+        if: ${{ steps.check.outputs.run == 'true' || inputs.dry_run || inputs.diag }}
         env:
           IG_TOKEN: ${{ secrets.IG_TOKEN }}
           IG_USER_ID: ${{ vars.IG_USER_ID }}

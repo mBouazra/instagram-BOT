@@ -196,8 +196,9 @@ def main():
         reel = next(r for r in list_reels() if r.get("media_url"))
         print(f"🔍 Test sur le Reel {reel['id']} (rien ne sera publié)")
         cid = prepare(0, reel)
-        print(f"  → {wait_container(cid)}")
-        return
+        info = wait_container(cid)
+        print(f"  → {info}")
+        sys.exit(0 if info.get("status_code") == "FINISHED" else 1)
 
     if not FORCE:
         reason = ""

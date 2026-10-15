@@ -5,8 +5,8 @@ Publie chaque jour tous les Reels de @myeleganza_ en story, dans le même ordre.
   expirent au moment où les nouvelles arrivent, donc tes vidéos sont toujours visibles,
   jamais en double.
 - Ordre fixe : du Reel le plus ancien au plus récent (ou l'inverse via config.json).
-- Pour chaque Reel : téléchargement → conversion au format story (1080x1920) →
-  lien public temporaire (1 h) → envoi à Instagram. Puis publication dans l'ordre.
+- Chaque Reel est converti UNE fois au format story (1080x1920) et hébergé par GitHub Pages
+  (branche gh-pages). Chaque jour, le bot ne fait plus que publier ces vidéos dans l'ordre.
 
 Variables d'environnement : IG_TOKEN (secret GitHub), IG_USER_ID.
 Options : FORCE=1 ignore l'heure et le "déjà posté aujourd'hui", DRY_RUN=1 ne publie rien,
@@ -28,7 +28,9 @@ from zoneinfo import ZoneInfo
 API = "https://graph.instagram.com"
 ROOT = Path(__file__).parent
 STATE_FILE = ROOT / "last_posted.txt"
-CACHE_FILE = ROOT / "video_cache.json"  # liens des vidéos déjà converties
+SITE = ROOT / "site"  # branche gh-pages (vidéos converties, servies par GitHub Pages)
+_owner, _, _repo = os.environ.get("GITHUB_REPOSITORY", "mBouazra/instagram-BOT").partition("/")
+PAGES_URL = os.environ.get("PAGES_URL") or f"https://{_owner.lower()}.github.io/{_repo}"
 WORK = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "stories"
 TZ = ZoneInfo("Europe/Paris")
 GAP_HOURS = 23  # attendre que la fournée de la veille ait (presque) expiré : pas de doublon
@@ -40,7 +42,6 @@ DRY_RUN = os.environ.get("DRY_RUN") == "1"
 DIAG = os.environ.get("DIAG") == "1"
 CHECK = os.environ.get("CHECK") == "1"
 CONFIG = json.loads((ROOT / "config.json").read_text())
-CACHE = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
 
 
 # ---------------------------------------------------------------- API Instagram
@@ -125,65 +126,82 @@ def reencode(src, dest):
     return dest
 
 
-def upload(path, endpoint, extra):
-    out = ""
-    for attempt in range(3):
-        out = subprocess.run(
-            ["curl", "-sS", "--max-time", "180", "-F", "reqtype=fileupload", *extra,
-             "-F", f"fileToUpload=@{path}", endpoint],
-            capture_output=True, text=True).stdout.strip()
-        if out.startswith("https://"):
-            return out
-        time.sleep(10 * (attempt + 1))
-    return None
+def video_file(reel):
+    return SITE / "v" / f"{reel['id']}.mp4"
 
 
-def public_link(path):
-    """Héberge la vidéo convertie. Renvoie (lien, permanent ?)."""
-    link = upload(path, "https://catbox.moe/user/api.php", [])  # lien permanent, réutilisé chaque jour
-    if link:
-        return link, True
-    link = upload(path, "https://litterbox.catbox.moe/resources/internals/api.php",
-                  ["-F", "time=72h"])  # secours : lien temporaire
-    if link:
-        return link, False
-    raise RuntimeError("hébergement indisponible")
+def video_url(reel):
+    return f"{PAGES_URL}/v/{reel['id']}.mp4"
 
 
-def build_link(idx, reel):
-    """Télécharge, convertit et héberge la vidéo d'un Reel (fait une seule fois par Reel)."""
+def convert(item):
+    """Télécharge et convertit un Reel dans le dossier du site. Renvoie une erreur ou None."""
+    idx, reel = item
     source = CONFIG.get("video_urls", {}).get(reel["id"]) or reel.get("media_url")
     if not source:
-        raise RuntimeError("pas de fichier fourni par Instagram → ajoute-le dans video_urls")
-    raw = download(source, WORK / f"{idx}_raw.mp4")
-    story = reencode(raw, WORK / f"{idx}_story.mp4")
-    link, permanent = public_link(story)
-    if permanent:
-        CACHE[reel["id"]] = link
-    return link
+        return "pas de fichier fourni par Instagram → ajoute-le dans video_urls"
+    try:
+        raw = download(source, WORK / f"{idx}_raw.mp4")
+        reencode(raw, video_file(reel))
+        print(f"  🎬 #{idx} convertie")
+        return None
+    except Exception as e:
+        video_file(reel).unlink(missing_ok=True)
+        print(f"  ⚠️  #{idx} conversion échouée : {e}")
+        return str(e)
 
 
-def prepare(idx, reel, fresh=False):
-    """Crée le conteneur story (avec la vidéo déjà prête si elle existe). Renvoie son ID."""
-    link = None if fresh else CACHE.get(reel["id"])
-    if not link:
-        link = build_link(idx, reel)
-    return call("POST", f"{USER_ID}/media", media_type="STORIES", video_url=link)["id"]
+def is_online(url):
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
-def safe_prepare(item, fresh=False):
+def publish_site(new_reels):
+    """Envoie les nouvelles vidéos sur GitHub Pages et attend qu'elles soient en ligne."""
+    git = ["git", "-C", str(SITE)]
+    subprocess.run(git + ["add", "v"], check=True)
+    subprocess.run(git + ["-c", "user.name=story-bot", "-c",
+                          "user.email=story-bot@users.noreply.github.com",
+                          "commit", "-q", "-m", f"{len(new_reels)} vidéo(s) convertie(s)"], check=True)
+    subprocess.run(git + ["push", "-q"], check=True)
+    print(f"🌐 {len(new_reels)} vidéo(s) envoyée(s) sur GitHub Pages, mise en ligne…")
+    deadline = time.time() + 900
+    pending = list(new_reels)
+    while pending and time.time() < deadline:
+        time.sleep(20)
+        pending = [r for r in pending if not is_online(video_url(r))]
+    if pending:
+        print(f"  ⚠️  {len(pending)} vidéo(s) pas encore en ligne après 15 min")
+
+
+def ensure_videos(indexed):
+    """Convertit les Reels pas encore hébergés. Renvoie {reel_id: erreur}."""
+    todo = [(i, r) for i, r in indexed if not video_file(r).exists()]
+    errors = {}
+    if todo:
+        (SITE / "v").mkdir(parents=True, exist_ok=True)
+        print(f"🎬 {len(todo)} vidéo(s) à convertir (une seule fois)…")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for (i, r), err in zip(todo, pool.map(convert, todo)):
+                if err:
+                    errors[r["id"]] = err
+        new = [r for _, r in todo if r["id"] not in errors]
+        if new:
+            publish_site(new)
+    return errors
+
+
+def create_container(item):
     idx, reel = item
     try:
-        cid = prepare(idx, reel, fresh)
-        print(f"  🎬 #{idx} prête")
-        return idx, reel, cid, None
+        return call("POST", f"{USER_ID}/media", media_type="STORIES",
+                    video_url=video_url(reel))["id"], None
     except Exception as e:
-        print(f"  ⚠️  #{idx} préparation échouée : {e}")
-        return idx, reel, None, str(e)
-
-
-def save_cache():
-    CACHE_FILE.write_text(json.dumps(CACHE, indent=1, sort_keys=True) + "\n")
+        return None, str(e)
 
 
 # ---------------------------------------------------------------- programme
@@ -202,8 +220,9 @@ def main():
     if DIAG:
         reel = next(r for r in list_reels() if r.get("media_url"))
         print(f"🔍 Test sur le Reel {reel['id']} (rien ne sera publié)")
-        cid = prepare(0, reel)
-        info = wait_container(cid)
+        err = ensure_videos([(0, reel)]).get(reel["id"])
+        cid, err = (None, err) if err else create_container((0, reel))
+        info = {"status_code": "ERROR", "status": err} if err else wait_container(cid)
         print(f"  → {info}")
         sys.exit(0 if info.get("status_code") == "FINISHED" else 1)
 
@@ -242,17 +261,22 @@ def main():
               f"{len(missing)} sans fichier : {missing}")
         return
 
-    # 1) Préparer toutes les vidéos (4 en parallèle), en gardant l'ordre.
-    #    Les vidéos déjà converties les jours précédents sont réutilisées directement.
-    print(f"🎬 Préparation ({sum(r['id'] in CACHE for r in reels)} vidéos déjà prêtes)…")
+    # 1) Convertir les nouveaux Reels (une seule fois), puis créer les stories chez Instagram
+    indexed = list(enumerate(reels, 1))
+    errors = ensure_videos(indexed)
+    ready = [(i, r) for i, r in indexed if r["id"] not in errors]
+    print(f"📤 Envoi de {len(ready)} stories à Instagram…")
     with ThreadPoolExecutor(max_workers=4) as pool:
-        prepared = list(pool.map(safe_prepare, enumerate(reels, 1)))
-    save_cache()
+        containers = dict(zip([r["id"] for _, r in ready], pool.map(create_container, ready)))
 
     # 2) Publier dans l'ordre
     posted, failed = 0, 0
-    for idx, reel, cid, err in prepared:
+    for idx, reel in indexed:
         reel_id = reel["id"]
+        err = errors.get(reel_id)
+        cid = None
+        if not err:
+            cid, err = containers[reel_id]
         if err:
             if "pas de fichier" in err:  # Reel avec musique sous licence : simple avertissement
                 print(f"  ⚠️  #{idx} {reel_id} ignorée : {err}")
@@ -264,13 +288,6 @@ def main():
             info = wait_container(cid)
         except RuntimeError as e:
             info = {"status_code": "ERROR", "status": str(e)}
-        if info.get("status_code") != "FINISHED":
-            # lien en cache peut-être mort : on reconvertit la vidéo et on réessaie une fois
-            print(f"  🔁 #{idx} refusée ({info.get('status_code')}), nouvelle conversion…")
-            CACHE.pop(reel_id, None)
-            _, _, cid, err = safe_prepare((idx, reel), fresh=True)
-            save_cache()
-            info = {"status_code": "ERROR", "status": err} if err else wait_container(cid)
         if info.get("status_code") != "FINISHED":
             print(f"  ❌ #{idx} {reel_id} : traitement Instagram {info.get('status_code')} "
                   f"{info.get('status', '')}")

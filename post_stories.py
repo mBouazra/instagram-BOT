@@ -195,6 +195,18 @@ def ensure_videos(indexed):
     return errors
 
 
+def still_on_account(reel_id):
+    """Vérifie juste avant de publier que le Reel est toujours sur le compte (pas supprimé)."""
+    try:
+        call("GET", reel_id, fields="id")
+        return True
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "does not exist" in msg or "unsupported get request" in msg or "cannot be loaded" in msg:
+            return False
+        return True  # autre erreur : dans le doute on publie
+
+
 def create_container(item):
     idx, reel = item
     try:
@@ -292,6 +304,9 @@ def main():
             print(f"  ❌ #{idx} {reel_id} : traitement Instagram {info.get('status_code')} "
                   f"{info.get('status', '')}")
             failed += 1
+            continue
+        if not still_on_account(reel_id):
+            print(f"  🗑️  #{idx} {reel_id} : Reel supprimé du compte (article vendu ?), story non publiée")
             continue
         try:
             call("POST", f"{USER_ID}/media_publish", creation_id=cid)
